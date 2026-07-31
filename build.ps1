@@ -34,10 +34,13 @@ if (-not $SkipApp) {
     if ($LASTEXITCODE -ne 0) { Write-Warning "self-test reported problems (models may simply be missing)" }
 }
 
-if (-not $SkipInstaller) {
-    Write-Host "==> Inno Setup" -ForegroundColor Cyan
-    & (Find-ISCC) installer.iss
-    if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+if ($SkipInstaller) {
+    Write-Host "==> installer skipped" -ForegroundColor Cyan
+    return
 }
+
+Write-Host "==> Inno Setup" -ForegroundColor Cyan
+& (Find-ISCC) installer.iss
+if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
 
 Get-ChildItem installer\*.exe | Select-Object Name, @{n = "MB"; e = { [math]::Round($_.Length / 1MB, 1) } }
