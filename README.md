@@ -1,5 +1,7 @@
 # Local Interpreter
 
+[![build](https://github.com/tur-ky/local-interpreter/actions/workflows/build.yml/badge.svg)](https://github.com/tur-ky/local-interpreter/actions/workflows/build.yml)
+
 A Windows desktop app that listens to your system audio or microphone and shows
 a live English translation of what is being said — entirely on your own machine.
 No cloud APIs, no external LLMs, no account, no telemetry.
