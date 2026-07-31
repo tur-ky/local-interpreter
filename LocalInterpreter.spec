@@ -119,17 +119,28 @@ a = Analysis(
     optimize=0,
 )
 
-# PyInstaller resolves ctranslate2.dll's CUDA dependencies to the copies inside
-# torch\lib and keeps that path, which duplicates ~750 MB of DLLs we already
-# place at the top level. Drop anything that landed under torch\.
-def _not_torch(entries):
-    return [e for e in entries if not e[0].lower().replace("/", "\\").startswith("torch\\")]
+# PyInstaller resolves ctranslate2.dll's CUDA dependencies to wherever the
+# providing pip package happens to keep them - torch\lib, or nvidia\*\bin for
+# the standalone wheels - and preserves that path. Each one is then a second
+# copy of a DLL already placed at the top level, which is close to a gigabyte
+# of pure duplication. Keep only the top-level copies.
+_cuda_names = {name.lower() for name in CUDA_DLLS}
 
 
-_before = len(a.binaries)
-a.binaries = _not_torch(a.binaries)
-a.datas = _not_torch(a.datas)
-print(f"[spec] dropped {_before - len(a.binaries)} duplicated torch\\lib binaries")
+def _drop_nested_cuda(entries):
+    kept, dropped = [], 0
+    for entry in entries:
+        dest = entry[0].replace("/", "\\")
+        if "\\" in dest and os.path.basename(dest).lower() in _cuda_names:
+            dropped += os.path.getsize(entry[1]) if os.path.isfile(entry[1]) else 0
+            continue
+        kept.append(entry)
+    return kept, dropped
+
+
+a.binaries, _dropped_bytes = _drop_nested_cuda(a.binaries)
+a.datas, _more = _drop_nested_cuda(a.datas)
+print(f"[spec] dropped {(_dropped_bytes + _more) / 1e6:,.0f} MB of duplicated CUDA libraries")
 
 pyz = PYZ(a.pure)
 
