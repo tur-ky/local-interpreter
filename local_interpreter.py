@@ -449,12 +449,54 @@ def model_is_complete(d: Path) -> bool:
     return (d / "model.bin").stat().st_size > 10_000_000
 
 
+def hf_cache_roots() -> list[Path]:
+    """Where `huggingface_hub` keeps downloads for everything else on the PC."""
+    roots: list[Path] = []
+    for var in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        value = os.environ.get(var)
+        if value:
+            roots.append(Path(value))
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        roots.append(Path(hf_home) / "hub")
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    out: list[Path] = []
+    for r in roots:
+        if r.is_dir() and r not in out:
+            out.append(r)
+    return out
+
+
+def hf_cached_model(size: str) -> Path | None:
+    """Reuse weights the machine already has from a pip/faster-whisper setup."""
+    repo = HF_REPOS.get(size)
+    if not repo:
+        return None
+    folder = "models--" + repo.replace("/", "--")
+    for root in hf_cache_roots():
+        snapshots = root / folder / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        try:
+            candidates = sorted(
+                (p for p in snapshots.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            continue
+        for snap in candidates:
+            if model_is_complete(snap):
+                return snap
+    return None
+
+
 def local_model_dir(size: str) -> Path | None:
     for base in model_search_dirs():
         cand = base / f"faster-whisper-{size}"
         if model_is_complete(cand):
             return cand
-    return None
+    return hf_cached_model(size)
 
 
 def resolve_model(size: str) -> str:

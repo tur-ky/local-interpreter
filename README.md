@@ -97,6 +97,15 @@ The installer itself is ~940 MB and carries every runtime dependency; the only
 thing it pulls from the network is the model weights, once. Everything after
 that is offline. Uninstalling asks before deleting the weights.
 
+**Already have the weights?** Nothing is downloaded twice. The wizard only
+offers a model the machine does not already have, and the downloader also
+recognises copies in the Hugging Face cache
+(`%USERPROFILE%\.cache\huggingface\hub`, `HF_HOME`, `HF_HUB_CACHE`), so a PC
+that already ran `faster-whisper` from pip reuses what is there. The Python
+dependencies are a different story: the app is frozen with its own embedded
+Python, so it ships its own copies and never reads your system `site-packages`.
+That is what makes it work on a machine with nothing installed.
+
 ---
 
 ## Diagnostics

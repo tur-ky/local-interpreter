@@ -46,8 +46,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
-Name: "getmedium"; Description: "medium  —  1.5 GB, fastest, good accuracy"; GroupDescription: "Speech models (downloaded now, then used fully offline):"
-Name: "getlarge"; Description: "large-v3  —  3.1 GB, best accuracy (recommended on an NVIDIA GPU)"; GroupDescription: "Speech models (downloaded now, then used fully offline):"
+; Only offered when the machine does not already have that model.
+Name: "getmedium"; Description: "medium  —  1.5 GB, fastest, good accuracy"; GroupDescription: "Speech models (downloaded now, then used fully offline):"; Check: ModelMissing('medium')
+Name: "getlarge"; Description: "large-v3  —  3.1 GB, best accuracy (recommended on an NVIDIA GPU)"; GroupDescription: "Speech models (downloaded now, then used fully offline):"; Check: ModelMissing('large-v3')
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -70,6 +71,17 @@ Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait pos
 [Code]
 var
   ModelsDir: String;
+
+// Reinstalling, upgrading, or installing next to an existing copy must not
+// re-download several GB of weights. The Hugging Face cache is checked too,
+// but only by the downloader itself - see local_model_dir() in the app.
+function ModelMissing(Size: String): Boolean;
+begin
+  Result := not FileExists(ExpandConstant('{commonappdata}\LocalInterpreter\models\faster-whisper-'
+                                          + Size + '\model.bin'))
+        and not FileExists(ExpandConstant('{localappdata}\LocalInterpreter\models\faster-whisper-'
+                                          + Size + '\model.bin'));
+end;
 
 function FetchModel(Size: String): Boolean;
 var
