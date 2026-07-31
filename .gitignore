@@ -1,0 +1,13 @@
+# build output
+build/
+dist/
+installer/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# the original task brief, not part of the product
+agents.md
