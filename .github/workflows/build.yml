@@ -80,9 +80,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $asset = (Get-ChildItem installer\*.exe)[0].FullName
-          if (gh release view $tag 2>$null) {
-            gh release upload $tag $asset --clobber
+          $asset = (Get-ChildItem installer\*.exe)[0]
+          $existing = gh release view $tag --json assets --jq '.assets[].name' 2>$null
+          if (-not $?) {
+            gh release create $tag $asset.FullName --title "Local Interpreter $tag" --generate-notes
+          } elseif ($existing -contains $asset.Name) {
+            # A release built and verified by hand already has its installer
+            # attached; never silently replace a tested binary.
+            "release $tag already carries $($asset.Name) - leaving it untouched"
           } else {
-            gh release create $tag $asset --title "Local Interpreter $tag" --generate-notes
+            gh release upload $tag $asset.FullName
           }
