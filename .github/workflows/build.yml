@@ -37,15 +37,32 @@ jobs:
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
 
-      - name: Build
+      - name: Freeze the app
         shell: pwsh
-        run: .\build.ps1
+        run: .\build.ps1 -SkipInstaller
+
+      - name: Verify the CUDA runtime was bundled
+        # Without these the packaged app silently falls back to the CPU, which
+        # is not something to find out after publishing a release.
+        shell: pwsh
+        run: |
+          $needed = @(
+            "cublas64_12.dll", "cublasLt64_12.dll", "cudnn64_9.dll",
+            "cudnn_graph64_9.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll",
+            "cudnn_engines_precompiled64_9.dll"
+          )
+          $missing = $needed | Where-Object { -not (Test-Path "dist\LocalInterpreter\$_") }
+          if ($missing) { throw "CUDA libraries missing from the build: $($missing -join ', ')" }
+          "dist: {0:N0} MB, all CUDA libraries present" -f `
+            ((Get-ChildItem dist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Build the installer
+        shell: pwsh
+        run: .\build.ps1 -SkipApp
 
       - name: Report sizes
         shell: pwsh
-        run: |
-          "dist: {0:N0} MB" -f ((Get-ChildItem dist -Recurse -File | Measure-Object Length -Sum).Sum/1MB)
-          Get-ChildItem installer | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+        run: Get-ChildItem installer | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
 
       - name: Upload the installer as a workflow artifact
         if: github.event_name == 'workflow_dispatch'
