@@ -10,6 +10,7 @@ No cloud APIs, no external LLMs, no account, no telemetry.
 
 **[Get the installer from the latest release »](https://github.com/tur-ky/local-interpreter/releases/latest)**
 
+
 Windows 10/11 64-bit. Nothing else to install — Python, Qt, the CUDA 12 runtime
 and cuDNN 9 all ship inside it. It is not code-signed, so SmartScreen will show
 "Windows protected your PC" the first time: *More info* → *Run anyway*.
@@ -40,9 +41,11 @@ and cuDNN 9 all ship inside it. It is not code-signed, so SmartScreen will show
 
 ## Using the app
 
-**Mode** — `Live` transcribes each utterance as soon as the speaker pauses.
-`Manual` records from Start to Stop and translates the whole take in one pass
-(slightly more accurate, since Whisper sees the full context).
+**Mode** — `Live` shows the sentence *as it is being spoken*: the running
+utterance is re-decoded about once a second and appears in italics under the
+transcript, then it is replaced by a higher-quality final pass when the speaker
+pauses. `Manual` records from Start to Stop and translates the whole take in one
+pass (slightly more accurate, since Whisper sees the full context).
 
 **Languages** — the left dropdown is the spoken language (`Auto-detect` is fine),
 the right one is the target. Whisper translates *into English* only; that is a
@@ -69,7 +72,15 @@ the transcript in the spoken language and says so.
 * *Style instructions* are appended to the prompt as `Style: ...`.
 
 **Settings → Engine & Audio** — model size, CUDA/CPU, compute type, explicit
-capture devices, and how aggressively live audio is split into utterances.
+capture devices, how aggressively live audio is split into utterances, and
+whether to stream text while someone is still speaking (turn it off to halve the
+GPU work).
+
+**If you hear nothing on System** — Windows will not let a loopback be opened on
+an endpoint another program holds in WASAPI *exclusive* mode, which is common
+with Voicemeeter, ASIO tools and some DAC drivers. The app then falls back to
+another loopback and says so in an amber banner; pick the right endpoint under
+Settings → Engine & Audio. It also warns if 25 seconds pass with no speech.
 
 ---
 
@@ -82,7 +93,7 @@ capture devices, and how aggressively live audio is split into utterances.
 * ~2 GB of disk for the program, plus up to 4.6 GB if you install both models
   (`medium` 1.5 GB, `large-v3` 3.1 GB)
 
-The installer itself is ~935 MB and carries every runtime dependency; the only
+The installer itself is ~940 MB and carries every runtime dependency; the only
 thing it pulls from the network is the model weights, once. Everything after
 that is offline. Uninstalling asks before deleting the weights.
 
@@ -123,7 +134,7 @@ found; if any are missing the packaged app still runs, just on the CPU.
 ```
 
 Output: `dist\LocalInterpreter\` (portable) and
-`installer\LocalInterpreter-Setup-1.0.0.exe`.
+`installer\LocalInterpreter-Setup-1.0.1.exe`.
 
 ---
 
@@ -138,6 +149,11 @@ Output: `dist\LocalInterpreter\` (portable) and
 * **CTranslate2 must be imported before Qt.** Loading its CUDA libraries into a
   process that already has Qt in it crashes with an access violation, so
   `local_interpreter.py` imports the engine above the PyQt6 imports on purpose.
+* **COM has to be initialised by `soundcard`'s own import.** Calling
+  `CoInitializeEx` first and importing soundcard afterwards makes its import
+  raise, because it treats `S_FALSE` ("already initialised on this thread") as
+  fatal — and under PyQt an exception escaping a slot aborts the process. See
+  `com_init()`.
 * **`soundcard` and unusual endpoints.** A device held in WASAPI exclusive mode
   by another program, or one whose mix format is not `WAVEFORMATEXTENSIBLE`,
   cannot be opened. The app tries every candidate device in turn and reports what

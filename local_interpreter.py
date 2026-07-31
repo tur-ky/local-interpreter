@@ -38,13 +38,15 @@ import numpy as np
 sys.modules.setdefault("torch", None)
 
 APP_NAME = "Local Interpreter"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 ORG_DIR = "LocalInterpreter"
 
 SAMPLE_RATE = 16000
 BLOCK_FRAMES = 1024               # ~64 ms per capture block
 MAX_PROMPT_CHARS = 850            # Whisper's prompt window is ~224 tokens
 MANUAL_LIMIT_S = 45 * 60          # cap on a single Manual-mode recording
+PARTIAL_EVERY_S = 1.2             # how often a running utterance is re-decoded
+PARTIAL_MIN_S = 0.8               # ...once it is at least this long
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -335,6 +337,7 @@ class Settings:
     silence_ms: int = 700
     max_segment_s: float = 14.0
     vad_sensitivity: int = 2                  # 1 (strict) .. 3 (loose)
+    stream_partials: bool = True              # live text while someone talks
 
     @staticmethod
     def load() -> "Settings":
@@ -514,34 +517,53 @@ def download_model(size: str, dest_root: Path, progress=None) -> Path:
 
 
 def com_init() -> None:
-    """soundcard only initialises COM on the importing thread."""
-    if sys.platform == "win32":
+    """Initialise COM for the calling thread.
+
+    soundcard initialises COM itself, but only once - in whichever thread
+    imports it first - and its error check treats S_FALSE ("this thread has
+    already initialised COM") as fatal. Calling CoInitializeEx ourselves and
+    *then* importing soundcard therefore makes the import raise
+    RuntimeError: Error 0x100000001, which under PyQt kills the process.
+
+    So: while the import is still pending, let it do the initialising; every
+    thread after that gets its own plain CoInitializeEx.
+    """
+    if sys.platform != "win32":
+        return
+    if "soundcard" not in sys.modules:
         try:
-            ctypes.windll.ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+            import soundcard  # noqa: F401  - its import initialises COM here
+            return
         except Exception:
-            pass
+            traceback.print_exc()
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+    except Exception:
+        pass
 
 
 def list_output_devices() -> list[str]:
-    import soundcard as sc
     try:
+        import soundcard as sc
         return [s.name for s in sc.all_speakers()]
     except Exception:
+        traceback.print_exc()
         return []
 
 
 def list_input_devices() -> list[str]:
-    import soundcard as sc
     try:
+        import soundcard as sc
         return [m.name for m in sc.all_microphones(include_loopback=False)]
     except Exception:
+        traceback.print_exc()
         return []
 
 
 def _loopback_candidates(preferred: str) -> list:
-    import soundcard as sc
     cands = []
     try:
+        import soundcard as sc
         if preferred:
             for m in sc.all_microphones(include_loopback=True):
                 if m.isloopback and m.name == preferred:
@@ -560,9 +582,9 @@ def _loopback_candidates(preferred: str) -> list:
 
 
 def _mic_candidates(preferred: str) -> list:
-    import soundcard as sc
     cands = []
     try:
+        import soundcard as sc
         if preferred:
             for m in sc.all_microphones(include_loopback=False):
                 if m.name == preferred:
@@ -589,12 +611,13 @@ class CaptureThread(threading.Thread):
     WAVEFORMATEXTENSIBLE), so every candidate device is tried in turn.
     """
 
-    def __init__(self, kind: str, preferred: str, out_q: queue.Queue, log):
+    def __init__(self, kind: str, preferred: str, out_q: queue.Queue, log, warn):
         super().__init__(daemon=True, name=f"capture-{kind}")
         self.kind = kind                      # "system" | "mic"
         self.preferred = preferred
         self.out_q = out_q
         self.log = log
+        self.warn = warn
         self._stop = threading.Event()
         self.device_name: str | None = None
         self.error: str | None = None
@@ -604,6 +627,15 @@ class CaptureThread(threading.Thread):
         self._stop.set()
 
     def run(self) -> None:
+        try:
+            self._capture()
+        except Exception as exc:                  # never die without saying why
+            traceback.print_exc()
+            self.error = f"{self.kind} capture failed: {exc}"
+        finally:
+            self.ready.set()
+
+    def _capture(self) -> None:
         com_init()
         cands = (_loopback_candidates if self.kind == "system" else _mic_candidates)(self.preferred)
         if not cands:
@@ -622,6 +654,15 @@ class CaptureThread(threading.Thread):
                     self.error = None
                     self.ready.set()
                     self.log(f"{self.kind}: capturing from “{dev.name}”")
+                    if problems:
+                        # Landing on a fallback device is the difference between
+                        # hearing the call and hearing nothing at all, so it has
+                        # to be said out loud rather than logged and forgotten.
+                        self.warn(
+                            f"Could not capture {problems[0]}, so “{dev.name}” is "
+                            f"being used instead. If you hear nothing, pick the "
+                            f"right device under Settings → Engine & Audio."
+                        )
                     while not self._stop.is_set():
                         data = rec.record(numframes=BLOCK_FRAMES)
                         if data is None or len(data) == 0:
@@ -654,15 +695,18 @@ class CaptureThread(threading.Thread):
 
 
 class AudioEngine(QThread):
-    segment_ready = pyqtSignal(object, str)   # np.ndarray, source label
+    segment_ready = pyqtSignal(object, str, int)    # audio, source label, utterance
+    partial_ready = pyqtSignal(object, str, int)    # same, mid-utterance
     level = pyqtSignal(float)
     failed = pyqtSignal(str)
-    info = pyqtSignal(str)
+    info = pyqtSignal(str)                    # transient, shown in the status line
+    warning = pyqtSignal(str)                 # sticky, shown until the next Start
 
     def __init__(self, settings: Settings, live: bool, parent=None):
         super().__init__(parent)
         self.s = settings
         self.live = live
+        self.partials = live and settings.stream_partials
         self._stop = threading.Event()
         self._captures: list[CaptureThread] = []
         self.manual_buffer: list[np.ndarray] = []
@@ -684,7 +728,7 @@ class AudioEngine(QThread):
         queues: dict[str, queue.Queue] = {k: queue.Queue(maxsize=400) for k in wanted}
         for kind in wanted:
             pref = self.s.system_device if kind == "system" else self.s.mic_device
-            t = CaptureThread(kind, pref, queues[kind], self.info.emit)
+            t = CaptureThread(kind, pref, queues[kind], self.info.emit, self.warning.emit)
             t.start()
             self._captures.append(t)
 
@@ -721,6 +765,12 @@ class AudioEngine(QThread):
         last_level_emit = 0.0
         aborted = False
         limit_warned = False
+        started_at = time.time()
+        loudest = 0.0
+        heard_speech = False
+        silence_warned = False
+        utterance = 0
+        last_partial = 0.0
 
         while not self._stop.is_set():
             for k in active:
@@ -773,6 +823,22 @@ class AudioEngine(QThread):
                 self.level.emit(min(1.0, rms * 12.0))
                 last_level_emit = now
 
+            # A loopback device nobody is playing to looks exactly like a working
+            # one - virtual devices even supply a noise floor - so judge it by
+            # whether any speech has actually turned up, not by pure silence.
+            loudest = max(loudest, rms)
+            if (self.live and not silence_warned and not heard_speech
+                    and now - started_at > 25.0):
+                silence_warned = True
+                where = ", ".join(f"“{t.device_name}”" for t in alive if t.device_name)
+                detail = ("it has been completely silent" if loudest < 0.002
+                          else f"only quiet background noise (peak {loudest:.3f})")
+                self.warning.emit(
+                    f"No speech picked up from {where or label} in 25 seconds — "
+                    f"{detail}. If someone is talking, this is the wrong device: "
+                    "choose another under Settings → Engine & Audio."
+                )
+
             if not self.live:
                 if self.manual_recorded < MANUAL_LIMIT_S * SAMPLE_RATE:
                     self.manual_buffer.append(block)
@@ -795,6 +861,9 @@ class AudioEngine(QThread):
                 silence_run = 0.0
                 if not in_speech and voiced_run >= 0.10:
                     in_speech = True
+                    heard_speech = True
+                    utterance += 1
+                    last_partial = now
                     speech = list(preroll)
                     preroll = []
                 if in_speech:
@@ -817,7 +886,13 @@ class AudioEngine(QThread):
                 in_speech = False
                 silence_run = 0.0
                 if len(audio) / SAMPLE_RATE >= 0.35:
-                    self.segment_ready.emit(audio, label)
+                    self.segment_ready.emit(audio, label, utterance)
+            elif (in_speech and self.partials and seg_len >= PARTIAL_MIN_S
+                    and now - last_partial >= PARTIAL_EVERY_S):
+                # Stream what has been said so far instead of making the reader
+                # wait for the speaker to stop talking.
+                last_partial = now
+                self.partial_ready.emit(np.concatenate(speech), label, utterance)
 
         for t in self._captures:
             t.stop()
@@ -826,7 +901,7 @@ class AudioEngine(QThread):
             audio = np.concatenate(self.manual_buffer)
             self.manual_buffer = []
             if len(audio) / SAMPLE_RATE >= 0.3:
-                self.segment_ready.emit(audio, label)
+                self.segment_ready.emit(audio, label, utterance + 1)
 
 
 # ---------------------------------------------------------------------------
@@ -839,10 +914,13 @@ class Job:
     audio: np.ndarray
     source: str
     live: bool
+    utterance: int = 0
+    partial: bool = False
 
 
 class Transcriber(QThread):
     result = pyqtSignal(dict)
+    partial = pyqtSignal(dict)
     status = pyqtSignal(str)
     failed = pyqtSignal(str)
     busy = pyqtSignal(bool)
@@ -854,12 +932,28 @@ class Transcriber(QThread):
         self.model = None
         self._loaded_key: tuple | None = None
         self._stop = threading.Event()
+        self._pending_partial: Job | None = None
+        self._plock = threading.Lock()
+        self._utt_lang: tuple[int, str | None] | None = None
+        self._final_utt = 0
 
     def submit(self, job: Job) -> None:
+        with self._plock:
+            self._final_utt = max(self._final_utt, job.utterance)
+            partial = self._pending_partial
+            if partial is not None and partial.utterance <= self._final_utt:
+                self._pending_partial = None   # that sentence is finished
         self.q.put(job)
+
+    def submit_partial(self, job: Job) -> None:
+        """Only the newest in-progress take matters; older ones are obsolete."""
+        with self._plock:
+            self._pending_partial = job
 
     def stop(self) -> None:
         self._stop.set()
+        with self._plock:
+            self._pending_partial = None
         self.q.put(None)
 
     # -- model -------------------------------------------------------------
@@ -930,6 +1024,19 @@ class Transcriber(QThread):
 
     # -- inference ---------------------------------------------------------
 
+    def _language_for(self, job: "Job", audio: np.ndarray) -> str | None:
+        """Detect once per utterance and reuse it for that utterance's partials.
+
+        Re-detecting on every partial would add its cost to every update, and
+        the answer cannot change halfway through a sentence anyway.
+        """
+        if job.utterance and self._utt_lang and self._utt_lang[0] == job.utterance:
+            return self._utt_lang[1]
+        lang = self._pick_language(audio)
+        if job.utterance:
+            self._utt_lang = (job.utterance, lang)
+        return lang
+
     def _pick_language(self, audio: np.ndarray) -> str | None:
         """Honour the source dropdown and the 'only these languages' lock."""
         if self.s.source_lang != "auto":
@@ -953,7 +1060,7 @@ class Transcriber(QThread):
         except Exception:
             return allowed[0]
 
-    def _run_whisper(self, audio, task, language, live) -> tuple[str, str | None]:
+    def _run_whisper(self, audio, task, language, live, vad=True) -> tuple[str, str | None]:
         segments, info = self.model.transcribe(
             audio,
             task=task,
@@ -962,7 +1069,7 @@ class Transcriber(QThread):
             beam_size=1 if live else 5,
             temperature=[0.0, 0.2, 0.4],
             condition_on_previous_text=False,
-            vad_filter=True,
+            vad_filter=vad,
             vad_parameters=dict(min_silence_duration_ms=250, speech_pad_ms=200),
             no_speech_threshold=0.6,
             log_prob_threshold=-1.0,
@@ -972,18 +1079,34 @@ class Transcriber(QThread):
         text = " ".join(s.text.strip() for s in segments).strip()
         return re.sub(r"\s+", " ", text), getattr(info, "language", None)
 
+    def _next_job(self) -> "Job | None | str":
+        """Finished utterances win; a partial is only decoded when idle."""
+        try:
+            job = self.q.get(timeout=0.05)
+        except queue.Empty:
+            with self._plock:
+                job, self._pending_partial = self._pending_partial, None
+                if job is not None and job.utterance <= self._final_utt:
+                    job = None                 # superseded while it waited
+            return job or "idle"
+        if job is None:
+            return None
+        # drop stale live audio if we fell behind
+        if job.live:
+            while self.q.qsize() > 3:
+                nxt = self.q.get()
+                if nxt is None:
+                    return None
+                job = nxt
+        return job
+
     def run(self) -> None:
         while not self._stop.is_set():
-            job = self.q.get()
-            if job is None or self._stop.is_set():
+            job = self._next_job()
+            if job is None:
                 break
-            # drop stale live audio if we fell behind
-            if job.live:
-                while self.q.qsize() > 3:
-                    nxt = self.q.get()
-                    if nxt is None:
-                        return
-                    job = nxt
+            if job == "idle":
+                continue
             if not self.ensure_model():
                 continue
             self.busy.emit(True)
@@ -993,8 +1116,29 @@ class Transcriber(QThread):
                 if peak > 0:
                     audio = audio * min(3.0, 0.85 / peak) if peak < 0.3 else audio
 
-                language = self._pick_language(audio)
+                language = self._language_for(job, audio)
                 want_english = self.s.target_lang == "en"
+
+                if job.partial:
+                    # One cheap pass only - this text is replaced within a
+                    # second or two by the next partial or by the final result.
+                    text, lang = self._run_whisper(
+                        audio,
+                        "translate" if want_english else "transcribe",
+                        language,
+                        live=True,
+                        vad=False,
+                    )
+                    text = apply_term_mappings(text, self.s.mappings())
+                    if text:
+                        self.partial.emit({
+                            "text": text,
+                            "utterance": job.utterance,
+                            "language": lang or language or "?",
+                            "input": job.source,
+                            "duration": len(audio) / SAMPLE_RATE,
+                        })
+                    continue
 
                 source_text = ""
                 detected = language
@@ -1019,15 +1163,17 @@ class Transcriber(QThread):
                 translation = apply_term_mappings(translation, self.s.mappings())
                 source_text = apply_term_mappings(source_text, self.s.mappings())
 
-                if translation or source_text:
-                    self.result.emit({
-                        "source_text": source_text,
-                        "translation": translation,
-                        "language": detected or "?",
-                        "input": job.source,
-                        "duration": len(audio) / SAMPLE_RATE,
-                        "time": time.strftime("%H:%M:%S"),
-                    })
+                self._utt_lang = None
+                self.result.emit({
+                    "source_text": source_text,
+                    "translation": translation,
+                    "language": detected or "?",
+                    "input": job.source,
+                    "utterance": job.utterance,
+                    "duration": len(audio) / SAMPLE_RATE,
+                    "time": time.strftime("%H:%M:%S"),
+                    "empty": not (translation or source_text),
+                })
             except Exception as exc:
                 traceback.print_exc()
                 self.failed.emit(f"Transcription failed: {exc}")
@@ -1382,6 +1528,15 @@ class SettingsDialog(QDialog):
         self.sens.setCurrentIndex(max(0, self.sens.findData(self.s.vad_sensitivity)))
         grid3.addWidget(self.sens, 2, 1)
         seg.addLayout(grid3)
+        self.stream_partials = QCheckBox(
+            "Show text as it is spoken, without waiting for a pause"
+        )
+        self.stream_partials.setChecked(self.s.stream_partials)
+        self.stream_partials.setToolTip(
+            "Re-decodes the running sentence about once a second. Turn it off to "
+            "halve the GPU work on a slower machine."
+        )
+        seg.addWidget(self.stream_partials)
         lay.addLayout(seg)
         lay.addStretch(1)
         return w
@@ -1410,6 +1565,7 @@ class SettingsDialog(QDialog):
         s.silence_ms = int(self.silence.currentData())
         s.max_segment_s = float(self.maxseg.currentData())
         s.vad_sensitivity = int(self.sens.currentData())
+        s.stream_partials = self.stream_partials.isChecked()
 
 
 # ---------------------------------------------------------------------------
@@ -1477,6 +1633,8 @@ QComboBox QAbstractItemView {
 QComboBox#lang { font-size: 14px; font-weight: 600; padding: 9px 12px; background: #161b22; }
 
 QTextEdit#transcript { background: #0d1117; border: none; padding: 4px 10px; font-size: 14px; }
+QLabel#live { color: #8b949e; font-size: 14px; font-style: italic;
+    padding: 8px 12px; border-top: 1px solid #21262d; }
 
 QTableWidget { gridline-color: #21262d; }
 QHeaderView::section { background: #161b22; color: #8b949e; border: none;
@@ -1529,6 +1687,8 @@ class MainWindow(QWidget):
         self.engine: AudioEngine | None = None
         self.running = False
         self.entries: list[dict] = []
+        self._live_utterance = 0
+        self._final_utterance = 0
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(make_icon())
@@ -1537,6 +1697,7 @@ class MainWindow(QWidget):
 
         self.transcriber = Transcriber(self.s)
         self.transcriber.result.connect(self.on_result)
+        self.transcriber.partial.connect(self.on_partial)
         self.transcriber.status.connect(self.set_status)
         self.transcriber.failed.connect(self.on_error)
         self.transcriber.busy.connect(self.on_busy)
@@ -1614,6 +1775,12 @@ class MainWindow(QWidget):
         self.lang_note.setWordWrap(True)
         root.addWidget(self.lang_note)
 
+        self.audio_note = QLabel("")
+        self.audio_note.setObjectName("warn")
+        self.audio_note.setWordWrap(True)
+        self.audio_note.hide()
+        root.addWidget(self.audio_note)
+
         # transcript ---------------------------------------------------------
         tcard = QFrame()
         tcard.setObjectName("card")
@@ -1651,6 +1818,14 @@ class MainWindow(QWidget):
         )
         self.transcript.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         tl.addWidget(self.transcript)
+
+        # Live caption: the sentence currently being spoken, replaced on every
+        # update and cleared once the finished version reaches the transcript.
+        self.live_line = QLabel("")
+        self.live_line.setObjectName("live")
+        self.live_line.setWordWrap(True)
+        self.live_line.hide()
+        tl.addWidget(self.live_line)
         root.addWidget(tcard, 1)
         self._render_placeholder()
 
@@ -1827,11 +2002,16 @@ class MainWindow(QWidget):
         live = self.s.mode == "live"
         self.set_status("Listening…" if live else "Recording — press Stop when done")
 
+        self.audio_note.clear()
+        self.audio_note.hide()
+
         self.engine = AudioEngine(self.s, live=live)
         self.engine.segment_ready.connect(self.on_segment)
+        self.engine.partial_ready.connect(self.on_partial_audio)
         self.engine.level.connect(self.meter.set_level)
         self.engine.failed.connect(self.on_audio_failed)
         self.engine.info.connect(self.set_status)
+        self.engine.warning.connect(self.show_audio_note)
         self.engine.start()
 
     def stop(self) -> None:
@@ -1845,16 +2025,42 @@ class MainWindow(QWidget):
             self.engine.stop()
             self.engine.wait(4000)
             self.engine = None
+        self.clear_live_line()
         self.set_status("Idle")
 
-    def on_segment(self, audio: np.ndarray, source: str) -> None:
-        self.transcriber.submit(Job(audio=audio, source=source, live=self.s.mode == "live"))
+    def on_segment(self, audio: np.ndarray, source: str, utterance: int) -> None:
+        self.transcriber.submit(Job(
+            audio=audio, source=source, live=self.s.mode == "live", utterance=utterance
+        ))
+
+    def on_partial_audio(self, audio: np.ndarray, source: str, utterance: int) -> None:
+        self.transcriber.submit_partial(Job(
+            audio=audio, source=source, live=True, utterance=utterance, partial=True
+        ))
+
+    def on_partial(self, e: dict) -> None:
+        # A partial can finish decoding after its own final has landed; showing
+        # it then would leave the sentence on screen twice.
+        if not self.running or e["utterance"] <= self._final_utterance:
+            return
+        self._live_utterance = e["utterance"]
+        self.live_line.setText(e["text"] + " …")
+        self.live_line.show()
+
+    def clear_live_line(self) -> None:
+        self._live_utterance = 0
+        self.live_line.clear()
+        self.live_line.hide()
 
     def on_busy(self, busy: bool) -> None:
         self.busy_label.setVisible(busy)
 
     def on_result(self, e: dict) -> None:
-        self.append_entry(e)
+        self._final_utterance = max(self._final_utterance, e.get("utterance", 0))
+        if e.get("utterance", 0) >= self._live_utterance:
+            self.clear_live_line()
+        if not e.get("empty"):
+            self.append_entry(e)
 
     def on_audio_failed(self, msg: str) -> None:
         self.stop()
@@ -1866,6 +2072,10 @@ class MainWindow(QWidget):
 
     def set_status(self, text: str) -> None:
         self.status.setText(text)
+
+    def show_audio_note(self, text: str) -> None:
+        self.audio_note.setText("⚠  " + text)
+        self.audio_note.show()
 
     # -- transcript actions -------------------------------------------------
 
@@ -2008,6 +2218,44 @@ def fetch_models_cli(sizes: list[str], dest: Path) -> int:
     return 0
 
 
+def ui_check() -> int:
+    """Build the window and the settings dialog in the app's real start order.
+
+    Has to run in its own process: the ordering that used to crash - COM
+    initialised before soundcard is imported - cannot be reproduced once
+    something else in the process has already imported soundcard.
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    com_init()
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    app.setStyleSheet(STYLESHEET)
+    s = Settings.load()
+    win = MainWindow(s)
+    rc = 0
+    try:
+        dlg = SettingsDialog(s, win)
+        outs, ins = dlg.sys_dev.count() - 1, dlg.mic_dev.count() - 1
+        print(f"      settings dialog built ({outs} output, {ins} input devices)")
+        dlg.apply_to(Settings())
+        dlg.deleteLater()
+
+        # The regression this exists for: audio capture is unusable if COM was
+        # initialised before soundcard got the chance to import. The device
+        # lists swallow that failure, so check the import itself.
+        try:
+            import soundcard  # noqa: F401
+            print("      soundcard imported after Qt startup")
+        except Exception as exc:
+            print(f"      soundcard IS BROKEN after Qt startup: {exc}")
+            rc = 1
+    finally:
+        win.transcriber.stop()
+        win.transcriber.wait(3000)
+    return rc
+
+
 def self_test_cli() -> int:
     """Console diagnostics: engine, GPU, models, audio devices."""
     print(f"{APP_NAME} {APP_VERSION} — self test")
@@ -2042,6 +2290,23 @@ def self_test_cli() -> int:
     except Exception as exc:
         print(f"      device enumeration failed: {exc}")
 
+    print("  user interface:")
+    try:
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, "--ui-check"] if is_frozen()
+            else [sys.executable, os.path.abspath(__file__), "--ui-check"],
+            capture_output=True, text=True, timeout=180,
+        )
+        print((proc.stdout or "").rstrip() or "      (no output)")
+        if proc.returncode != 0:
+            print(f"      FAILED (exit {proc.returncode})")
+            print((proc.stderr or "").rstrip()[-1500:])
+            return 2                          # 2 = broken, as opposed to 1 = no models
+    except Exception as exc:
+        print(f"      could not run the interface check: {exc}")
+        return 2
+
     if not installed:
         print("\nNo models installed - run with --fetch-models medium,large-v3")
         return 1
@@ -2068,6 +2333,35 @@ def self_test_cli() -> int:
     return 0
 
 
+def install_exception_guard() -> None:
+    """Keep an unexpected error from taking the whole app down.
+
+    PyQt calls qFatal() - which aborts the process - when a Python exception
+    escapes a slot, unless the application installs its own excepthook. A bug
+    in one dialog should not close the window mid-call.
+    """
+    reporting = {"busy": False}
+
+    def hook(exc_type, exc, tb) -> None:
+        traceback.print_exception(exc_type, exc, tb)
+        if reporting["busy"] or issubclass(exc_type, KeyboardInterrupt):
+            return
+        reporting["busy"] = True
+        try:
+            QMessageBox.critical(
+                None,
+                APP_NAME,
+                "Something went wrong, but the app is still running.\n\n"
+                f"{exc_type.__name__}: {exc}",
+            )
+        except Exception:
+            pass
+        finally:
+            reporting["busy"] = False
+
+    sys.excepthook = hook
+
+
 def main() -> int:
     if "--self-test" in sys.argv or "--fetch-models" in sys.argv:
         try:                                   # the installer console is cp1252
@@ -2075,6 +2369,9 @@ def main() -> int:
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    if "--ui-check" in sys.argv:
+        return ui_check()
 
     if "--self-test" in sys.argv:
         return self_test_cli()
@@ -2101,6 +2398,7 @@ def main() -> int:
 
     com_init()
     app = QApplication(sys.argv)
+    install_exception_guard()
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setStyleSheet(STYLESHEET)

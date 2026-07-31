@@ -7,7 +7,7 @@
 ; embedding those would make the installer roughly five times larger.
 
 #define AppName        "Local Interpreter"
-#define AppVersion     "1.0.0"
+#define AppVersion     "1.0.1"
 #define AppPublisher   "Local Interpreter"
 #define AppExe         "LocalInterpreter.exe"
 #define FetchExe       "LocalInterpreterFetch.exe"

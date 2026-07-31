@@ -31,11 +31,10 @@ if (-not $SkipApp) {
 
     Write-Host "==> self-test of the frozen build" -ForegroundColor Cyan
     & ".\dist\LocalInterpreter\LocalInterpreterFetch.exe" --self-test
-    if ($LASTEXITCODE -ne 0) {
-        # It exits non-zero when no model is installed, which is normal on a
-        # build machine. Don't let that become the script's exit code.
-        Write-Warning "self-test reported problems (models may simply be missing)"
-    }
+    # 1 only means no model is installed, which is normal on a build machine.
+    # 2 means the build is actually broken - never ship that.
+    if ($LASTEXITCODE -ge 2) { throw "self-test failed: the frozen build is broken" }
+    if ($LASTEXITCODE -ne 0) { Write-Warning "no models installed on this machine" }
     $global:LASTEXITCODE = 0
 }
 
